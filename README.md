@@ -1,8 +1,8 @@
 # Agentic URL Shortener
 
-This project demonstrates an agentic software engineering workflow for building a production-style URL shortener service using FastAPI. The repository includes:
+This project contains an asynchronous FastAPI URL shortener and an agentic software engineering workflow. The repository includes:
 
-- A working FastAPI prototype in app.py
+- The URL shortener API in `app.py`
 - An orchestration layer in orchestrator.py that models SDLC stages, retries, rollback, and human approval
 - Supporting documentation describing architecture, scenarios, risks, and validation practice
 - Automated tests covering the required URL-shortening behaviors
@@ -11,38 +11,60 @@ This project demonstrates an agentic software engineering workflow for building 
 
 Build a working prototype that turns a requirement into a reviewable engineering outcome using an agentic execution model. The system must show requirement understanding, decomposition, implementation, validation, and reviewability while staying within safe autonomy boundaries.
 
-## 2. Prototype Overview
+## 2. `app.py` Overview
 
-The application exposes three core behaviors:
+`app.py` is the runnable FastAPI service. It uses asynchronous SQLite access through
+`aiosqlite`, creates its database tables during application startup, and runs an
+hourly background cleanup task for expired links.
 
-1. POST /shorten
-   - Accepts a URL payload
-   - Creates a short code and stores metadata in SQLite
-   - Returns the short code plus analytics metadata
+### API endpoints
 
-2. GET /{id}
-   - Resolves a short code to its original URL
-   - Performs a redirect with HTTP 307
-   - Increments the click counter in storage
+- `POST /shorten` accepts a JSON object with a required absolute HTTP(S) `url` and
+  optional `custom_id` and `ttl_seconds`. It returns the generated or requested ID,
+  short URL, destination URL, and optional expiration time. `ttl_seconds` must be
+  between 60 seconds and one year. Custom IDs must be 3–16 letters, numbers,
+  underscores, or hyphens; an already allocated ID returns HTTP 409.
+- `GET /{id}` redirects to the destination with HTTP 307. Missing links return
+  HTTP 404, and expired links return HTTP 410. Click details are recorded in a
+  background task; client IP addresses are hashed before storage.
+- `GET /analytics/{id}` returns the destination, creation and expiration times,
+  total clicks, approximate unique visitors, and last-click time. Unknown IDs
+  return HTTP 404.
+- `GET /health` checks database read/write availability and returns HTTP 200 when
+  healthy or HTTP 503 when the check fails.
 
-3. GET /analytics/{id}
-   - Returns the record for a short URL including original URL, click count, and creation timestamp
-   - Returns 404 when the identifier does not exist
+Interactive API documentation is available at `http://127.0.0.1:8000/docs` after
+the service starts.
+
+### Configuration and persistence
+
+`app.py` reads these settings from environment variables or `.env`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ENV` | `production` | Environment label (`development`, `production`, or `testing`) |
+| `LOG_LEVEL` | `INFO` | Application logging level |
+| `BASE_URL` | `http://localhost:8000` | Base URL used to construct returned short links |
+| `API_KEY_ROTATION_SALT` | Development default | Hex salt used when hashing client IPs; set a private value of at least 32 hex characters for deployments |
+| `SQLITE_DB_FILE` | `shortener.db` | SQLite database file path |
+
+The SQLite database stores short URL mappings and click events. SQLite WAL mode
+and foreign-key enforcement are enabled for connections.
 
 ## 3. Architecture Overview
 
 ### Core Components
 
-- FastAPI app layer
-  - Handles HTTP requests and response validation
-  - Exposes endpoint contract for shorten, redirect, and analytics behaviors
+- FastAPI app layer in `app.py`
+  - Handles request validation, URL creation, redirects, analytics, and health checks
+  - Uses a lifespan handler to initialize the database and manage the expiration sweeper
 
 - SQLite persistence layer
-  - Stores rows with: id, original_url, created_at, clicks
-  - Uses parameterized SQL to minimize injection risk
+  - Stores URL mappings and click-event records
+  - Uses parameterized SQL and foreign-key relationships
 
 - Observability and logging
-  - Logs key lifecycle events such as creation, redirect, and analytic lookups
+  - Reports application events and database health
 
 - Agentic orchestration layer
   - Captures SDLC stages: requirements, decomposition, implementation, testing, documentation, human approval
@@ -58,34 +80,86 @@ The application exposes three core behaviors:
 5. Human approval decides whether code is written to disk.
 6. Safe-stop and rollback behaviors handle failure or rejected output.
 
-## 4. Setup Instructions
+## 4. Run the URL Shortener
 
 ### Prerequisites
 
-- Python 3.10+
-- A virtual environment
-- Project dependencies installed from the environment used for this repo
+- Python 3.10 or later
+- `pip`
+- Network access for the initial dependency installation
 
-### Recommended Local Setup
+### Install and start
 
-1. Activate the project virtual environment.
-2. Install dependencies if needed:
-   - fastapi
-   - pydantic
-   - uvicorn
-   - pytest
-   - google-generativeai (optional for the orchestration agent)
-3. Run the app:
+From the repository root, create and activate a virtual environment, then install
+the packages used by `app.py`:
 
-   uvicorn app:app --reload
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install fastapi uvicorn pydantic pydantic-settings aiosqlite pytest httpx
+```
 
-4. Test the endpoints with curl or a tool such as Postman / FastAPI TestClient.
+`pytest` and `httpx` are needed only for the test suite; they are not imported by
+the running API. Start the API from the repository root:
 
-Example:
+```powershell
+python -m uvicorn app:app --reload
+```
 
-- POST request to /shorten with JSON payload {"url": "<https://example.com"}>
-- GET /{short_id}
-- GET /analytics/{short_id}
+The service is available at `http://127.0.0.1:8000`; open
+`http://127.0.0.1:8000/docs` to try its endpoints. The database file is created
+at the path configured by `SQLITE_DB_FILE` (by default, `shortener.db` in the
+working directory).
+
+Example requests:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/shorten `
+  -ContentType 'application/json' `
+  -Body '{"url":"https://example.com/path","ttl_seconds":3600}'
+
+Invoke-RestMethod -Uri http://127.0.0.1:8000/health
+```
+
+Use the returned `id` to query `http://127.0.0.1:8000/analytics/{id}` or open
+`http://127.0.0.1:8000/{id}` to follow the redirect. If you change
+`API_KEY_ROTATION_SALT`, use a private hex value of at least 32 characters; do
+not commit deployment secrets.
+
+To run the repository test suite, use:
+
+```powershell
+python -m pytest
+```
+
+### Run the orchestrator
+
+Run `python orchestrator.py` separately when you want the SDLC workflow and its
+human approval step. On startup, it checks the third-party imports in `app.py`
+and installs any missing packages into the Python environment running the
+orchestrator. This requires `pip` and network access. Starting the API directly
+with Uvicorn does not perform that dependency check.
+
+Generated implementations are checked for valid Python syntax, the FastAPI
+application object, and the three required routes before they can be approved.
+The generator is instructed to keep test-only imports out of `app.py` and to
+ignore unrelated values in `.env`; invalid generated code is replaced with the
+built-in implementation.
+
+### Configure Gemini for the orchestrator
+
+The orchestrator does not retrieve or create API keys. Create one in
+[Google AI Studio](https://aistudio.google.com/app/apikey), then configure it locally:
+
+1. Copy `.env.example` to `.env` in the same directory as `orchestrator.py`.
+2. Replace `replace-with-your-own-key` with your key in `.env`.
+3. Run `python orchestrator.py`. The `.env` file is found beside the script even if
+   you launch it from a different working directory.
+
+Alternatively, set `GEMINI_API_KEY` in your process environment. Keep `.env` private
+and do not commit your real key. If no key is configured, the orchestrator uses its
+default implementation path.
 
 ## 5. Agentic Orchestration Model
 

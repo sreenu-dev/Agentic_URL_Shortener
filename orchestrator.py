@@ -1,8 +1,11 @@
 # orchestrator.py
+import ast
+import importlib.util
 import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -17,6 +20,147 @@ else:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('AgenticOrchestrator')
+
+
+APP_PACKAGE_DISTRIBUTIONS = {
+    'pydantic_settings': 'pydantic-settings',
+    'pytest_asyncio': 'pytest-asyncio',
+}
+APP_RUNTIME_MODULES = {
+    'aiosqlite',
+    'fastapi',
+    'pydantic',
+    'pydantic_settings',
+    'uvicorn',
+}
+REQUIRED_APP_ROUTES = {
+    ('POST', '/shorten'),
+    ('GET', '/{id}'),
+    ('GET', '/analytics/{id}'),
+    ('GET', '/health'),
+}
+
+
+def install_app_dependencies(app_path: Path) -> None:
+    """Install third-party packages imported by app.py if they are missing."""
+    tree = ast.parse(app_path.read_text(encoding='utf-8'), filename=str(app_path))
+    imported_modules = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name.split('.', 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported_modules.add(node.module.split('.', 1)[0])
+
+    missing_distributions = set()
+    for module_name in sorted(imported_modules):
+        if module_name in sys.stdlib_module_names:
+            continue
+        if (app_path.parent / f'{module_name}.py').exists() or (
+            app_path.parent / module_name / '__init__.py'
+        ).exists():
+            continue
+        if importlib.util.find_spec(module_name) is None:
+            missing_distributions.add(
+                APP_PACKAGE_DISTRIBUTIONS.get(module_name, module_name)
+            )
+
+    if not missing_distributions:
+        logger.info('All third-party app.py dependencies are already installed.')
+        return
+
+    packages = sorted(missing_distributions)
+    logger.info('Installing missing app.py dependencies: %s', ', '.join(packages))
+    subprocess.run(
+        [sys.executable, '-m', 'pip', 'install', *packages],
+        check=True,
+    )
+
+
+def validate_app_code(code: str) -> str:
+    """Check generated source syntax, runtime imports, app object, and required routes."""
+    try:
+        tree = ast.parse(code, filename='app.py')
+        compile(tree, 'app.py', 'exec')
+    except SyntaxError as exc:
+        raise ValueError(f'Generated app.py has invalid Python syntax: {exc}') from exc
+
+    app_is_fastapi = any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == 'app'
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+        )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == 'FastAPI'
+        for node in tree.body
+    )
+    if not app_is_fastapi:
+        raise ValueError('Generated app.py must define app = FastAPI(...).')
+
+    routes = set()
+    route_positions = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if (
+                not isinstance(decorator, ast.Call)
+                or not isinstance(decorator.func, ast.Attribute)
+                or not isinstance(decorator.func.value, ast.Name)
+                or decorator.func.value.id != 'app'
+                or decorator.func.attr.lower() not in {'get', 'post'}
+                or not decorator.args
+                or not isinstance(decorator.args[0], ast.Constant)
+                or not isinstance(decorator.args[0].value, str)
+            ):
+                continue
+            method = decorator.func.attr.upper()
+            route = re.sub(r'\{[^{}]+\}', '{id}', decorator.args[0].value)
+            routes.add((method, route))
+            route_positions.setdefault((method, route), node.lineno)
+
+    missing_routes = REQUIRED_APP_ROUTES - routes
+    if missing_routes:
+        formatted_routes = ', '.join(
+            f'{method} {route}' for method, route in sorted(missing_routes)
+        )
+        raise ValueError(f'Generated app.py is missing required routes: {formatted_routes}.')
+
+    if route_positions[('GET', '/health')] > route_positions[('GET', '/{id}')]:
+        raise ValueError(
+            'Define GET /health before GET /{id}; otherwise the dynamic route shadows health checks.'
+        )
+
+    imported_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name.split('.', 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported_modules.add(node.module.split('.', 1)[0])
+
+    test_modules = imported_modules & {'pytest', 'pytest_asyncio', 'httpx'}
+    if test_modules:
+        names = ', '.join(sorted(test_modules))
+        raise ValueError(
+            f'Generated app.py must not import test-only packages ({names}); '
+            'keep tests under tests/.'
+        )
+
+    unsupported_modules = (
+        imported_modules - sys.stdlib_module_names - APP_RUNTIME_MODULES
+    )
+    if unsupported_modules:
+        names = ', '.join(sorted(unsupported_modules))
+        raise ValueError(
+            f'Generated app.py imports unsupported third-party packages: {names}. '
+            'Use only the standard library, FastAPI, Pydantic, and Uvicorn.'
+        )
+
+    return 'Python syntax, FastAPI app object, runtime imports, and required routes validated.'
 
 
 DEFAULT_APP_CODE = '''from fastapi import FastAPI, HTTPException
@@ -99,6 +243,11 @@ def create_short_url(payload: URLCreate):
                 raise HTTPException(status_code=500, detail='Internal server error')
 
 
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
+
+
 @app.get('/{short_id}')
 def redirect_to_url(short_id: str):
     with sqlite3.connect(DB_FILE) as conn:
@@ -133,11 +282,6 @@ def get_url_analytics(short_id: str):
     }
 
 
-@app.get('/healthz')
-def healthz():
-    return {'status': 'ok'}
-
-
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run('app:app', host='0.0.0.0', port=8000, reload=True)
@@ -154,7 +298,10 @@ def load_env_key(path: Path) -> str:
             continue
         key, value = candidate.split('=', 1)
         if key.strip() == 'GEMINI_API_KEY':
-            return value.strip().strip('"\'')
+            value = value.strip().strip('"\'')
+            if value.lower() == 'replace-with-your-own-key':
+                return ''
+            return value
     return ''
 
 
@@ -195,9 +342,15 @@ class AgentOrchestrator:
         self._configure_gemini()
 
     def _configure_gemini(self):
-        api_key = os.getenv('GEMINI_API_KEY') or load_env_key(Path('.env'))
+        api_key = os.getenv('GEMINI_API_KEY', '').strip() or load_env_key(
+            Path(__file__).resolve().parent / '.env'
+        )
         if not api_key:
-            logger.warning('GEMINI_API_KEY not configured. The orchestrator will fall back to the default implementation build.')
+            logger.warning(
+                'GEMINI_API_KEY is missing. Create a key in Google AI Studio and set it '
+                'in the environment or in .env beside orchestrator.py. The orchestrator '
+                'will fall back to the default implementation build.'
+            )
             return
 
         if genai is None:
@@ -206,7 +359,7 @@ class AgentOrchestrator:
 
         try:
             genai.configure(api_key=api_key)
-            model_name = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
+            model_name = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash')
             self.model = genai.GenerativeModel(model_name)
             logger.info('Gemini model configured: %s', model_name)
         except Exception as exc:
@@ -319,9 +472,23 @@ class AgentOrchestrator:
 
     def _implement_code(self):
         prompt = (
-            'Write a production-ready FastAPI URL shortener service. Required endpoints: POST /shorten, '
-            'GET /{id}, GET /analytics/{id}. Use SQLite, safe SQL parameters, click tracking, and a clean '
-            'response model. Output only raw Python code with no markdown wrappers.\n\n'
+            'Write one complete, directly runnable FastAPI application for a URL shortener. '
+            'It must define a module-level `app = FastAPI(...)` and these routes: POST /shorten, '
+            'GET /{short_id}, and GET /analytics/{short_id}. Use SQLite from the Python standard '
+            'library, parameterized SQL, URL validation, consistent response models, and explicit '
+            '404 handling. Include GET /health and register it before the catch-all GET /{short_id} '
+            'route so the health check is reachable. Keep all test code in separate files '
+            'under tests/; do not import pytest, pytest_asyncio, or httpx in app.py. '
+            'Use only standard-library modules plus FastAPI, Pydantic, Uvicorn, '
+            'aiosqlite, and pydantic-settings. '
+            'Do not use extra third-party packages, external services, or network calls. '
+            'If using Pydantic Settings to read .env, configure it to ignore unrelated variables '
+            '(for example SettingsConfigDict(env_file=".env", extra="ignore")) so Gemini and other '
+            'environment settings do not prevent the API from starting. '
+            'Initialize storage safely and make `python -m uvicorn app:app --reload` work from '
+            'the project directory. Do not execute database initialization as an import side effect; '
+            'use FastAPI lifespan startup where needed. Return only complete Python source code, '
+            'without markdown fences or commentary.\n\n'
             'Task breakdown:\n' + (self.context.get('tasks') or 'Implement the default service.')
         )
         try:
@@ -329,14 +496,35 @@ class AgentOrchestrator:
             code = self._extract_python_code(raw_output)
         except RuntimeError:
             code = DEFAULT_APP_CODE
+            self._add_decision('Gemini unavailable; using the built-in FastAPI implementation.')
+
+        try:
+            validation = validate_app_code(code)
+        except ValueError as exc:
+            logger.warning('Generated implementation did not pass validation: %s', exc)
+            self._add_decision(
+                f'Generated implementation failed validation ({exc}); using the built-in implementation.'
+            )
+            code = DEFAULT_APP_CODE
+            validation = validate_app_code(code)
 
         self.context['draft_code'] = code
-        self._add_decision('Implementation draft generated and validated for code extraction.')
+        self.context['validation_result'] = validation
+        self._add_decision(validation)
         self.state = SDLCState.TESTING
 
     def _run_validation(self):
-        self.context['validation_result'] = 'Manual validation required using FastAPI TestClient and sqlite-backed checks.'
-        self._add_decision('Implementation entered validation stage with guided checks.')
+        code = self.context.get('draft_code', DEFAULT_APP_CODE)
+        try:
+            self.context['validation_result'] = validate_app_code(code)
+        except ValueError as exc:
+            logger.warning('Draft failed validation before approval: %s', exc)
+            self.context['draft_code'] = DEFAULT_APP_CODE
+            self.context['validation_result'] = validate_app_code(DEFAULT_APP_CODE)
+            self._add_decision(
+                f'Draft failed pre-approval validation ({exc}); replaced with the built-in implementation.'
+            )
+        self._add_decision('Draft passed pre-approval static validation.')
         self.state = SDLCState.DOCUMENTATION
 
     def _write_documentation(self):
@@ -356,14 +544,17 @@ class AgentOrchestrator:
         print('Decision lineage:')
         for item in self.context.get('decision_log', []):
             print(f'- {item}')
+        print('\nValidation:')
+        print(self.context.get('validation_result', 'No validation result recorded.'))
         print('\nImplementation preview:')
         print(preview[:600] + ('\n...[truncated]...' if len(preview) > 600 else ''))
         print('=' * 60)
 
         decision = input('Approve and write app.py? (y/n/retry): ').strip().lower()
         if decision == 'y':
-            Path('app.py').write_text(preview, encoding='utf-8')
-            self._add_decision('Human approved and app.py was written to disk.')
+            target = Path(__file__).resolve().with_name('app.py')
+            target.write_text(preview, encoding='utf-8')
+            self._add_decision(f'Human approved and {target} was written to disk.')
             self.state = SDLCState.COMPLETED
         elif decision == 'retry':
             self.metrics['rollbacks'] += 1
@@ -380,6 +571,7 @@ class AgentOrchestrator:
 
 
 if __name__ == '__main__':
+    install_app_dependencies(Path(__file__).resolve().with_name('app.py'))
     initial_prompt = (
         'Build a URL shortener service using FastAPI. It must include POST /shorten, GET /{id}, and GET /analytics/{id}. '
         'Track click counts, validate URL inputs, and ensure secure SQLite parameterization and documentation. '
