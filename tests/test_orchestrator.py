@@ -143,10 +143,12 @@ def test_validate_app_code_accepts_builtin_implementation():
             'def shorten(): pass\n'
             '@app.get("/health")\n'
             'def health(): pass\n'
-            '@app.get("/{short_id}")\n'
-            'def redirect(short_id): pass\n'
+            '@app.get("/urls")\n'
+            'def list_urls(): pass\n'
             '@app.get("/analytics/{short_id}")\n'
-            'def analytics(short_id): pass\n',
+            'def analytics(short_id): pass\n'
+            '@app.get("/{short_id}")\n'
+            'def redirect(short_id): pass\n',
             'test-only packages',
         ),
         (
@@ -157,10 +159,12 @@ def test_validate_app_code_accepts_builtin_implementation():
             'def shorten(): pass\n'
             '@app.get("/health")\n'
             'def health(): pass\n'
-            '@app.get("/{short_id}")\n'
-            'def redirect(short_id): pass\n'
+            '@app.get("/urls")\n'
+            'def list_urls(): pass\n'
             '@app.get("/analytics/{short_id}")\n'
-            'def analytics(short_id): pass\n',
+            'def analytics(short_id): pass\n'
+            '@app.get("/{short_id}")\n'
+            'def redirect(short_id): pass\n',
             'unsupported third-party packages',
         ),
     ],
@@ -188,6 +192,7 @@ def test_implement_code_uses_builtin_when_generated_code_fails_validation():
     assert 'required routes validated' in agent.context['validation_result']
     assert agent.state == orchestrator.SDLCState.TESTING
     assert 'do not import pytest' in prompts[0]
+    assert 'GET /urls' in prompts[0]
 
 
 def test_validate_app_code_rejects_health_route_shadowed_by_catch_all():
@@ -196,13 +201,15 @@ def test_validate_app_code_rejects_health_route_shadowed_by_catch_all():
         'app = FastAPI()\n'
         '@app.post("/shorten")\n'
         'def shorten(): pass\n'
-        '@app.get("/{short_id}")\n'
-        'def redirect(short_id): pass\n'
+        '@app.get("/urls")\n'
+        'def list_urls(): pass\n'
         '@app.get("/analytics/{short_id}")\n'
         'def analytics(short_id): pass\n'
+        '@app.get("/{short_id}")\n'
+        'def redirect(short_id): pass\n'
         '@app.get("/health")\n'
         'def health(): pass\n'
     )
 
-    with pytest.raises(ValueError, match='shadows health checks'):
+    with pytest.raises(ValueError, match='may shadow it'):
         orchestrator.validate_app_code(source)

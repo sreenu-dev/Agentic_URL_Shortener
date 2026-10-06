@@ -19,19 +19,28 @@ hourly background cleanup task for expired links.
 
 ### API endpoints
 
-- `POST /shorten` accepts a JSON object with a required absolute HTTP(S) `url` and
-  optional `custom_id` and `ttl_seconds`. It returns the generated or requested ID,
-  short URL, destination URL, and optional expiration time. `ttl_seconds` must be
-  between 60 seconds and one year. Custom IDs must be 3–16 letters, numbers,
-  underscores, or hyphens; an already allocated ID returns HTTP 409.
-- `GET /{id}` redirects to the destination with HTTP 307. Missing links return
-  HTTP 404, and expired links return HTTP 410. Click details are recorded in a
-  background task; client IP addresses are hashed before storage.
-- `GET /analytics/{id}` returns the destination, creation and expiration times,
-  total clicks, approximate unique visitors, and last-click time. Unknown IDs
-  return HTTP 404.
-- `GET /health` checks database read/write availability and returns HTTP 200 when
-  healthy or HTTP 503 when the check fails.
+- `POST /shorten` accepts a JSON object with an absolute HTTP(S) `url` and returns
+  the short code, short URL, original URL, and creation time. Invalid or unsafe
+  URLs are rejected.
+- `GET /urls` lists all shortened URL mappings as an array with `id`, `short_url`,
+  and `long_url` fields. It returns an empty array when no URLs have been created.
+- `GET /{short_id}` redirects to the destination with HTTP 307. Unknown short
+  codes return HTTP 404.
+- `GET /analytics/{short_id}` returns the destination, creation time, active
+  status, and click count. Unknown IDs return HTTP 404.
+- `GET /health` returns `{"status":"healthy"}` with HTTP 200.
+
+Example: `GET http://127.0.0.1:8000/urls` returns entries like:
+
+```json
+[
+  {
+    "id": "Ab12xYz9",
+    "short_url": "http://localhost:8000/Ab12xYz9",
+    "long_url": "https://example.com/page"
+  }
+]
+```
 
 Interactive API documentation is available at `http://127.0.0.1:8000/docs` after
 the service starts.

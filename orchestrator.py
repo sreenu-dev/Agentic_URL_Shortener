@@ -38,6 +38,7 @@ REQUIRED_APP_ROUTES = {
     ('GET', '/{id}'),
     ('GET', '/analytics/{id}'),
     ('GET', '/health'),
+    ('GET', '/urls')
 }
 
 
@@ -130,10 +131,12 @@ def validate_app_code(code: str) -> str:
         )
         raise ValueError(f'Generated app.py is missing required routes: {formatted_routes}.')
 
-    if route_positions[('GET', '/health')] > route_positions[('GET', '/{id}')]:
-        raise ValueError(
-            'Define GET /health before GET /{id}; otherwise the dynamic route shadows health checks.'
-        )
+    catch_all_position = route_positions[('GET', '/{id}')]
+    for static_route in ('/health', '/analytics/{id}', '/urls'):
+        if route_positions[('GET', static_route)] > catch_all_position:
+            raise ValueError(
+                f'Define GET {static_route} before GET /{{id}}; otherwise the dynamic route may shadow it.'
+            )
 
     imported_modules = set()
     for node in ast.walk(tree):
@@ -189,6 +192,12 @@ class URLInfo(BaseModel):
     original_url: str
     clicks: int = 0
     created_at: str
+
+
+class ShortenedURLListItem(BaseModel):
+    id: str
+    short_url: str
+    long_url: str
 
 
 def init_db() -> None:
@@ -248,19 +257,22 @@ def health():
     return {'status': 'ok'}
 
 
-@app.get('/{short_id}')
-def redirect_to_url(short_id: str):
+@app.get('/urls', response_model=list[ShortenedURLListItem])
+def list_urls():
     with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute('SELECT original_url FROM urls WHERE id = ?', (short_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail='Short URL not found')
+        rows = conn.execute(
+            'SELECT id, original_url FROM urls ORDER BY created_at DESC, id'
+        ).fetchall()
 
-        target_url = row[0]
-        conn.execute('UPDATE urls SET clicks = clicks + 1 WHERE id = ?', (short_id,))
-        conn.commit()
-
-    logger.info('Redirecting %s to %s', short_id, target_url)
-    return RedirectResponse(url=target_url, status_code=307)
+    base_url = os.getenv('BASE_URL', 'http://localhost:8000').rstrip('/')
+    return [
+        {
+            'id': row[0],
+            'short_url': f'{base_url}/{row[0]}',
+            'long_url': row[1],
+        }
+        for row in rows
+    ]
 
 
 @app.get('/analytics/{short_id}', response_model=URLInfo)
@@ -280,6 +292,21 @@ def get_url_analytics(short_id: str):
         'clicks': row[2],
         'created_at': row[3],
     }
+
+
+@app.get('/{short_id}')
+def redirect_to_url(short_id: str):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute('SELECT original_url FROM urls WHERE id = ?', (short_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail='Short URL not found')
+
+        target_url = row[0]
+        conn.execute('UPDATE urls SET clicks = clicks + 1 WHERE id = ?', (short_id,))
+        conn.commit()
+
+    logger.info('Redirecting %s to %s', short_id, target_url)
+    return RedirectResponse(url=target_url, status_code=307)
 
 
 if __name__ == '__main__':
@@ -474,10 +501,11 @@ class AgentOrchestrator:
         prompt = (
             'Write one complete, directly runnable FastAPI application for a URL shortener. '
             'It must define a module-level `app = FastAPI(...)` and these routes: POST /shorten, '
-            'GET /{short_id}, and GET /analytics/{short_id}. Use SQLite from the Python standard '
+            'GET /{short_id}, GET /analytics/{short_id}, GET /urls, and GET /health. '
+            'GET /urls must return every short code, its full short URL, and its destination as long_url. '
+            'Register all fixed paths before the catch-all GET /{short_id}. Use SQLite from the Python standard '
             'library, parameterized SQL, URL validation, consistent response models, and explicit '
-            '404 handling. Include GET /health and register it before the catch-all GET /{short_id} '
-            'route so the health check is reachable. Keep all test code in separate files '
+            '404 handling. Keep all test code in separate files '
             'under tests/; do not import pytest, pytest_asyncio, or httpx in app.py. '
             'Use only standard-library modules plus FastAPI, Pydantic, Uvicorn, '
             'aiosqlite, and pydantic-settings. '

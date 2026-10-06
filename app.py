@@ -89,6 +89,12 @@ class ShortenResponse(BaseModel):
     created_at: str
 
 
+class ShortenedURLListItem(BaseModel):
+    id: str
+    short_url: str
+    long_url: str
+
+
 class AnalyticsResponse(BaseModel):
     id: str
     long_url: str
@@ -189,6 +195,25 @@ async def analytics(short_id: str):
                 created_at=str(row["created_at"]),
                 is_active=bool(row["is_active"]),
             )
+
+
+@app.get("/urls", response_model=list[ShortenedURLListItem])
+async def list_urls():
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT id, long_url FROM urls ORDER BY created_at DESC, id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    base_url = settings.base_url.rstrip("/")
+    return [
+        ShortenedURLListItem(
+            id=row["id"],
+            short_url=f"{base_url}/{row['id']}",
+            long_url=row["long_url"],
+        )
+        for row in rows
+    ]
 
 
 @app.get("/{short_id}")
